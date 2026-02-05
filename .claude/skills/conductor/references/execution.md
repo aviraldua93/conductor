@@ -2,8 +2,6 @@
 
 Complete reference for running, validating, and debugging Conductor workflows.
 
-**Best Practice:** Always use `-V` (verbose) mode when running workflows to see execution progress.
-
 ## CLI Commands
 
 ### conductor run
@@ -11,32 +9,46 @@ Complete reference for running, validating, and debugging Conductor workflows.
 Execute a workflow:
 
 ```bash
-conductor -V run <workflow.yaml> [OPTIONS]
+conductor run <workflow.yaml> [OPTIONS]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--input`, `-i NAME=VALUE` | Workflow input (repeatable) |
 | `--input.NAME=VALUE` | Alternative input syntax |
-| `--provider`, `-p PROVIDER` | Override provider |
+| `--provider`, `-p PROVIDER` | Override provider (copilot, claude) |
 | `--dry-run` | Show execution plan only |
 | `--skip-gates` | Auto-select first option at human gates |
-| `--verbose`, `-V` | Show detailed progress (**recommended**) |
+
+**Global options** (before the subcommand):
+
+| Option | Description |
+|--------|-------------|
+| `--verbose`, `-V` | Show full prompts and detailed tool call information |
+| `--version`, `-v` | Show version and exit |
+
+> **Note:** Progress output is shown by default. Use `-V` for full untruncated prompts, tool arguments, and reasoning details.
 
 **Examples:**
 
 ```bash
-# Standard run (always use -V)
+# Standard run (progress shown by default)
+conductor run workflow.yaml --input question="Hello"
+
+# Full verbose mode (untruncated prompts, tool args, reasoning)
 conductor -V run workflow.yaml --input question="Hello"
 
 # Multiple inputs
-conductor -V run workflow.yaml -i topic="AI" -i depth="detailed"
+conductor run workflow.yaml -i topic="AI" -i depth="detailed"
 
 # Skip human gates for automation
-conductor -V run workflow.yaml --skip-gates
+conductor run workflow.yaml --skip-gates
 
-# Dry run to preview
+# Dry run to preview execution plan
 conductor run workflow.yaml --dry-run
+
+# Override provider
+conductor run workflow.yaml -p claude
 ```
 
 ### conductor validate
@@ -49,10 +61,12 @@ conductor validate <workflow.yaml>
 
 Checks:
 - YAML syntax
-- Required fields
-- Agent references
+- Required fields and schema structure
+- Agent references and route targets
 - Route reachability
 - Template syntax
+- Parallel group agent references
+- For-each source format and reserved names
 
 ### conductor init
 
@@ -91,15 +105,43 @@ conductor templates
 
 ## Execution Flow
 
-1. **Load** - Parse YAML and validate structure
-2. **Initialize** - Set up provider and MCP servers
-3. **Execute** - Run agents following routes
-4. **Collect** - Gather outputs per schema
-5. **Return** - Output final result as JSON
+1. **Load** — Parse YAML and validate structure
+2. **Initialize** — Set up provider(s) and MCP servers
+3. **Execute** — Run agents following routes:
+   - Sequential agents execute one at a time
+   - Parallel groups execute agents concurrently with context snapshots
+   - For-each groups spawn N agent instances from runtime array
+4. **Collect** — Gather outputs per schema
+5. **Return** — Output final result as JSON
+
+### Iteration Counting
+
+- Each agent execution counts as 1 iteration
+- Parallel agents count individually (3 parallel agents = 3 iterations)
+- For-each instances each count as 1 iteration
+- Loop-back patterns increment the counter on each cycle
+
+## Cost Tracking
+
+Conductor tracks token usage and costs automatically when using verbose output:
+
+```yaml
+cost:
+  show_per_agent: true    # Per-agent cost breakdown
+  show_summary: true      # Total cost summary at end
+  pricing:                # Override default pricing
+    custom-model:
+      input_per_mtok: 3.0
+      output_per_mtok: 15.0
+      cache_read_per_mtok: 0.3
+      cache_write_per_mtok: 3.75
+```
+
+Output includes input/output token counts and estimated costs per agent and in total.
 
 ## Debugging
 
-### Use Verbose Mode
+### Use Full Verbose Mode
 
 ```bash
 conductor -V run workflow.yaml --input question="test"
@@ -107,9 +149,11 @@ conductor -V run workflow.yaml --input question="test"
 
 Shows:
 - Agent execution order
-- Prompt content sent
+- Full prompt content (untruncated)
 - Output received
 - Route decisions
+- Tool call arguments and reasoning
+- Token usage and costs per agent
 
 ### Dry Run
 
@@ -117,7 +161,7 @@ Shows:
 conductor run workflow.yaml --dry-run
 ```
 
-Preview execution plan without running agents.
+Preview execution plan without running agents. Shows the workflow graph, agent order, and configuration.
 
 ### Validate First
 
@@ -125,7 +169,7 @@ Preview execution plan without running agents.
 conductor validate workflow.yaml
 ```
 
-Catch configuration errors before execution.
+Catch configuration errors before execution. Reports agent count, parallel groups, for-each groups, human gates, and more.
 
 ### Check Exit Codes
 
@@ -156,7 +200,7 @@ conductor run workflow.yaml --input question="value"
 Error: Route references unknown agent: reviewer
 ```
 
-**Fix:** Check agent name spelling matches in routes.
+**Fix:** Check agent/group name spelling matches in routes.
 
 ### "Unreachable agent"
 
@@ -175,7 +219,7 @@ Error: Workflow exceeded max_iterations (10)
 **Fix:** Increase limit or fix loop condition:
 ```yaml
 limits:
-  max_iterations: 20
+  max_iterations: 50  # Max: 500
 ```
 
 ### "Timeout"
@@ -203,14 +247,26 @@ Error: Undefined variable 'agent_name' in template
 {% endif %}
 ```
 
+### "Parallel groups must contain at least 2 agents"
+
+**Fix:** Add at least 2 agents to the parallel group.
+
+### "Invalid source format" (for-each)
+
+**Fix:** Use dotted path with 3+ parts: `agent_name.output.field`
+
+### "Loop variable conflicts with reserved name"
+
+**Fix:** Choose a different `as` name. Reserved: `workflow`, `context`, `output`, `_index`, `_key`
+
 ## Human Gates
 
 When workflow reaches a human gate:
 
-1. **Display** - Shows prompt and options in terminal
-2. **Wait** - Pauses for user selection
-3. **Capture** - Records decision and optional feedback
-4. **Route** - Continues based on selection
+1. **Display** — Shows prompt and options in terminal
+2. **Wait** — Pauses for user selection
+3. **Capture** — Records selected value and optional text input (prompt_for)
+4. **Route** — Continues to the route specified on the selected option
 
 ### Skip Gates for Automation
 
@@ -220,13 +276,27 @@ conductor run workflow.yaml --skip-gates
 
 Auto-selects the first option at each gate.
 
-## Provider Options
+## Provider Configuration
 
-Override the default provider:
+### Override Provider
 
 ```bash
-conductor run workflow.yaml -p claude       # Use Claude
-conductor run workflow.yaml -p openai-agents # Use OpenAI
+conductor run workflow.yaml -p claude       # Use Claude for all agents
+conductor run workflow.yaml -p copilot      # Use Copilot (default)
+```
+
+### Per-Agent Provider Override
+
+Set `provider` on individual agents in YAML for multi-provider workflows:
+
+```yaml
+agents:
+  - name: fast_task
+    provider: claude
+    model: claude-haiku-4.5
+  - name: complex_task
+    # Uses workflow default provider
+    model: gpt-5.2
 ```
 
 ## Output Handling
@@ -256,22 +326,29 @@ conductor run workflow.yaml --input q="test" | jq '.answer'
 |----------|-------------|
 | `GITHUB_TOKEN` | GitHub Copilot authentication |
 | `ANTHROPIC_API_KEY` | Claude provider API key |
-| `OPENAI_API_KEY` | OpenAI provider API key |
-| `CONDUCTOR_LOG_LEVEL` | Logging level (debug, info, warning, error) |
+| `CONDUCTOR_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR) |
+
+Environment variables in YAML configs support `${VAR}` and `${VAR:-default}` interpolation syntax.
 
 ## Performance Tips
 
-1. **Use appropriate models** - Smaller models for simple tasks
-2. **Limit context** - Use `explicit` mode to reduce tokens
-3. **Set timeouts** - Prevent runaway workflows
-4. **Batch inputs** - Process multiple items in one agent when possible
+1. **Use appropriate models** — Smaller models (Haiku) for simple tasks, larger (Sonnet/Opus) for complex reasoning
+2. **Use `explicit` context mode** — Reduces token usage by only passing declared inputs
+3. **Set timeouts** — Prevent runaway workflows with `limits.timeout_seconds`
+4. **Use parallel groups** — Run independent agents concurrently
+5. **Use for-each groups** — Process arrays in parallel with `max_concurrent` batching
+6. **Set `max_tokens`** — Limit output length to save costs (especially with Claude)
+7. **Use per-agent provider** — Pick the best model/provider for each task
 
 ## Debugging Checklist
 
 1. [ ] Run `conductor validate workflow.yaml`
-2. [ ] Check all agent names match between definition and routes
-3. [ ] Verify entry_point exists
+2. [ ] Check all agent/group names match between definition and routes
+3. [ ] Verify entry_point exists as an agent, parallel group, or for-each group
 4. [ ] Ensure all paths lead to `$end`
 5. [ ] Test with `--dry-run` first
-6. [ ] Use `--verbose` to trace execution
+6. [ ] Use `-V` to trace execution with full details
 7. [ ] Check template variables are defined before use
+8. [ ] Verify for-each `source` resolves to an array
+9. [ ] Check parallel groups have 2+ agents
+10. [ ] Review cost output for unexpected token usage
