@@ -6,12 +6,18 @@ all provider implementations must use to ensure a consistent interface.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
+
+# Type alias for event callbacks that receive structured SDK events.
+# Callback signature: (event_type: str, data: dict[str, Any]) -> None
+EventCallback = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass
@@ -56,6 +62,9 @@ class AgentOutput:
     model: str | None = None
     """Actual model used (may differ from requested if aliased)."""
 
+    partial: bool = False
+    """Whether this output is partial (from a mid-agent interrupt)."""
+
 
 class AgentProvider(ABC):
     """Abstract base class for SDK providers.
@@ -86,6 +95,8 @@ class AgentProvider(ABC):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -94,6 +105,15 @@ class AgentProvider(ABC):
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent.
+            interrupt_signal: Optional event that, when set, signals a
+                mid-agent interrupt request. Providers that support
+                mid-agent interrupts should monitor this event during
+                execution and return partial output when it fires.
+                Providers that do not support mid-agent interrupts may
+                ignore this parameter.
+            event_callback: Optional callback for streaming SDK events
+                upstream (reasoning, tool calls, messages). Called with
+                (event_type, data_dict) for each interesting SDK event.
 
         Returns:
             Normalized AgentOutput with structured content.

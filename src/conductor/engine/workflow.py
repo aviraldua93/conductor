@@ -8,23 +8,32 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import time as _time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.usage import UsageTracker
-from conductor.exceptions import ConductorError, ExecutionError, MaxIterationsError
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
+from conductor.exceptions import ConductorError, ExecutionError, InterruptError, MaxIterationsError
 from conductor.executor.agent import AgentExecutor
+from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
 from conductor.gates.human import (
     GateResult,
     HumanGateHandler,
     MaxIterationsHandler,
 )
+from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
+from conductor.providers.base import AgentOutput
+
+logger = logging.getLogger(__name__)
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
@@ -389,6 +398,9 @@ class WorkflowEngine:
         provider: AgentProvider | None = None,
         registry: ProviderRegistry | None = None,
         skip_gates: bool = False,
+        workflow_path: Path | None = None,
+        interrupt_event: asyncio.Event | None = None,
+        event_emitter: WorkflowEventEmitter | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -400,6 +412,14 @@ class WorkflowEngine:
                 When provided, each agent can use a different provider based
                 on the agent's `provider` field or the workflow default.
             skip_gates: If True, auto-selects first option at human gates.
+            workflow_path: Path to the workflow YAML file. Used for checkpoint
+                metadata when saving state on failure.
+            interrupt_event: Optional asyncio.Event for interrupt signaling.
+                When set, the engine checks for user interrupts between agents.
+            event_emitter: Optional event emitter for publishing workflow events.
+                When provided, the engine emits events at each execution point
+                (agent start/complete, routing, parallel groups, etc.).
+                When None, zero overhead (early return in _emit()).
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -408,6 +428,7 @@ class WorkflowEngine:
         """
         self.config = config
         self.skip_gates = skip_gates
+        self.workflow_path = workflow_path
         self.context = WorkflowContext()
         self.renderer = TemplateRenderer()
         self.router = Router()
@@ -417,6 +438,7 @@ class WorkflowEngine:
         )
         self.gate_handler = HumanGateHandler(skip_gates=skip_gates)
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
+        self.script_executor = ScriptExecutor()
         self.usage_tracker = UsageTracker(
             pricing_overrides=self._build_pricing_overrides(),
         )
@@ -434,6 +456,17 @@ class WorkflowEngine:
             # Create a placeholder - will be created per-agent when using registry
             self.executor = None
             self.provider = None
+
+        # Interrupt support
+        self._interrupt_event = interrupt_event
+        self._interrupt_handler = InterruptHandler(skip_gates=skip_gates)
+
+        # Event emitter for workflow observability
+        self._event_emitter = event_emitter
+
+        # Checkpoint tracking
+        self._current_agent_name: str | None = None
+        self._last_checkpoint_path: Path | None = None
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
@@ -457,6 +490,42 @@ class WorkflowEngine:
                 cache_write_per_mtok=pricing_override.cache_write_per_mtok,
             )
         return overrides
+
+    def _emit(self, event_type: str, data: dict[str, Any]) -> None:
+        """Emit a workflow event if an emitter is configured.
+
+        Creates a WorkflowEvent and dispatches it to the emitter. When no
+        emitter is configured (None), this is a no-op with zero overhead.
+
+        Args:
+            event_type: The event type identifier (e.g., "agent_started").
+            data: Event-specific payload data.
+        """
+        if self._event_emitter is None:
+            return
+        event = WorkflowEvent(type=event_type, timestamp=_time.time(), data=data)
+        self._event_emitter.emit(event)
+
+    def _make_event_callback(self, agent_name: str) -> Any:
+        """Create an event callback for an agent that forwards to the emitter.
+
+        Returns None when no emitter is configured, so the callback plumbing
+        is entirely skipped in non-dashboard mode.
+
+        Args:
+            agent_name: The agent name to inject into forwarded events.
+
+        Returns:
+            An EventCallback function, or None if no emitter is configured.
+        """
+        if self._event_emitter is None:
+            return None
+
+        def _callback(event_type: str, data: dict[str, Any]) -> None:
+            data_with_agent = {"agent_name": agent_name, **data}
+            self._emit(event_type, data_with_agent)
+
+        return _callback
 
     async def _get_executor_for_agent(self, agent: AgentDef) -> AgentExecutor:
         """Get the appropriate executor for an agent.
@@ -486,6 +555,24 @@ class WorkflowEngine:
                 "No provider configured for workflow execution",
                 suggestion="Provide either a provider or registry to WorkflowEngine",
             )
+
+    async def _execute_script(self, agent: AgentDef, context: dict[str, Any]) -> ScriptOutput:
+        """Execute a script step with workflow-level timeout enforcement.
+
+        Args:
+            agent: Script agent definition.
+            context: Workflow context for template rendering.
+
+        Returns:
+            ScriptOutput with stdout, stderr, and exit_code.
+
+        Raises:
+            ExecutionError: If script fails or times out.
+        """
+        return await self.limits.wait_for_with_timeout(
+            self.script_executor.execute(agent, context),
+            operation_name=f"script '{agent.name}'",
+        )
 
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
@@ -520,9 +607,318 @@ class WorkflowEngine:
         # Execute on_start hook
         self._execute_hook("on_start")
 
+        return await self._execute_loop(current_agent_name)
+
+    async def resume(self, current_agent_name: str) -> dict[str, Any]:
+        """Resume workflow execution from a specific agent.
+
+        Assumes ``self.context`` and ``self.limits`` have been pre-loaded
+        from checkpoint data via :meth:`set_context` and :meth:`set_limits`.
+        Enters the main execution loop at *current_agent_name* without
+        resetting iteration counters.
+
+        Args:
+            current_agent_name: Name of the agent to resume from.
+
+        Returns:
+            Final output dict built from output templates.
+
+        Raises:
+            ExecutionError: If the agent is not found or execution fails.
+            MaxIterationsError: If max iterations limit is exceeded.
+            TimeoutError: If timeout limit is exceeded.
+        """
+        # Fresh timeout window for resumed execution
+        self.limits.start_time = _time.monotonic()
+
+        # Execute on_start hook (signals resume)
+        self._execute_hook("on_start")
+
+        return await self._execute_loop(current_agent_name)
+
+    def set_context(self, context: WorkflowContext) -> None:
+        """Replace the engine's workflow context with a restored one.
+
+        Used by the CLI resume path to inject context reconstructed from
+        a checkpoint file.
+
+        Args:
+            context: A WorkflowContext restored via ``WorkflowContext.from_dict()``.
+        """
+        self.context = context
+
+    def set_limits(self, limits: LimitEnforcer) -> None:
+        """Replace the engine's limit enforcer with a restored one.
+
+        Used by the CLI resume path to inject limits reconstructed from
+        a checkpoint file.
+
+        Args:
+            limits: A LimitEnforcer restored via ``LimitEnforcer.from_dict()``.
+        """
+        self.limits = limits
+
+    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
+        """Attempt to save a checkpoint after a failure.
+
+        This method never raises — on failure it logs a warning so the
+        original error is not masked.
+
+        Args:
+            error: The exception that triggered the checkpoint save.
+        """
+        if self.workflow_path is None:
+            logger.debug("No workflow_path set; skipping checkpoint save")
+            return
+
+        # Collect session IDs from provider if available
+        copilot_session_ids: dict[str, str] | None = None
+        provider = self._single_provider
+        if provider is not None and hasattr(provider, "get_session_ids"):
+            copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
+        elif self._registry is not None:
+            for p in self._registry.get_active_providers().values():
+                if hasattr(p, "get_session_ids"):
+                    copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
+                    break
+
+        checkpoint_path = CheckpointManager.save_checkpoint(
+            workflow_path=self.workflow_path,
+            context=self.context,
+            limits=self.limits,
+            current_agent=self._current_agent_name or "unknown",
+            error=error,
+            inputs=self.context.workflow_inputs,
+            copilot_session_ids=copilot_session_ids,
+        )
+        self._last_checkpoint_path = checkpoint_path
+
+    def _get_top_level_agent_names(self) -> list[str]:
+        """Return names of top-level agents (excluding parallel/for-each nested agents).
+
+        Used by the interrupt handler to populate the list of agents available
+        for "skip to agent".
+
+        Returns:
+            List of top-level agent names.
+        """
+        return [a.name for a in self.config.agents]
+
+    async def _check_interrupt(self, current_agent_name: str) -> InterruptResult | None:
+        """Check for a pending interrupt and handle it if present.
+
+        If the interrupt event is set, clears it, builds an output preview
+        from the last stored output, and delegates to the InterruptHandler
+        for user interaction.
+
+        Args:
+            current_agent_name: Name of the agent that just completed
+                (or the next agent about to run).
+
+        Returns:
+            InterruptResult if an interrupt was handled, None otherwise.
+        """
+        if self._interrupt_event is None or not self._interrupt_event.is_set():
+            return None
+
+        self._interrupt_event.clear()
+
+        # Build output preview from last stored output
+        import json
+
+        last_output = self.context.get_latest_output()
+        last_output_preview: str | None = None
+        if last_output is not None:
+            try:
+                preview = json.dumps(last_output, indent=2, default=str)
+                last_output_preview = preview[:500]
+            except (TypeError, ValueError):
+                last_output_preview = str(last_output)[:500]
+
+        return await self._interrupt_handler.handle_interrupt(
+            current_agent=current_agent_name,
+            iteration=self.context.current_iteration,
+            last_output_preview=last_output_preview,
+            available_agents=self._get_top_level_agent_names(),
+            accumulated_guidance=list(self.context.user_guidance),
+        )
+
+    async def _handle_interrupt_result(
+        self,
+        result: InterruptResult,
+        current_agent_name: str,
+    ) -> str:
+        """Apply the result of an interrupt interaction.
+
+        Args:
+            result: The InterruptResult from the handler.
+            current_agent_name: The current agent name (for error context).
+
+        Returns:
+            The next agent name to execute (may be unchanged, or a skip target).
+
+        Raises:
+            InterruptError: If the user selected "stop workflow".
+        """
+        match result.action:
+            case InterruptAction.CONTINUE:
+                if result.guidance:
+                    self.context.add_guidance(result.guidance)
+                return current_agent_name
+            case InterruptAction.SKIP:
+                return result.skip_target or current_agent_name
+            case InterruptAction.STOP:
+                raise InterruptError(agent_name=current_agent_name)
+            case InterruptAction.CANCEL:
+                return current_agent_name
+
+    async def _handle_partial_output(
+        self,
+        agent: AgentDef,
+        partial_output: AgentOutput,
+        agent_context: dict[str, Any],
+        guidance_section: str | None,
+        executor: AgentExecutor,
+        agent_start_time: float,
+    ) -> AgentOutput:
+        """Handle partial output from a mid-agent interrupt.
+
+        Invokes the interrupt handler to collect user guidance, then either:
+        - Sends a follow-up to the interrupted session (Copilot provider), or
+        - Re-executes the agent with guidance appended (other providers).
+
+        Args:
+            agent: The agent that was interrupted.
+            partial_output: The partial output from the interrupted agent.
+            agent_context: The context used for the agent execution.
+            guidance_section: The guidance section used in the original execution.
+            executor: The executor used for the agent.
+            agent_start_time: The start time of the agent execution.
+
+        Returns:
+            The final (non-partial) AgentOutput after handling the interrupt.
+        """
+        import json as _json
+
+        from conductor.providers.copilot import CopilotProvider
+
+        # Build preview from partial output
+        try:
+            preview = _json.dumps(partial_output.content, indent=2, default=str)[:500]
+        except (TypeError, ValueError):
+            preview = str(partial_output.content)[:500]
+
+        # Invoke the interrupt handler
+        interrupt_result = await self._interrupt_handler.handle_interrupt(
+            current_agent=agent.name,
+            iteration=self.context.current_iteration,
+            last_output_preview=preview,
+            available_agents=self._get_top_level_agent_names(),
+            accumulated_guidance=list(self.context.user_guidance),
+        )
+
+        # Apply the interrupt result
+        if interrupt_result.action == InterruptAction.STOP:
+            raise InterruptError(agent_name=agent.name)
+
+        if interrupt_result.action == InterruptAction.CANCEL or not interrupt_result.guidance:
+            # No guidance provided — use partial output as final
+            partial_output.partial = False
+            return partial_output
+
+        # Add guidance to context
+        self.context.add_guidance(interrupt_result.guidance)
+
+        # Try Copilot follow-up if provider supports it
+        provider = executor.provider
+        if isinstance(provider, CopilotProvider):
+            session = provider.get_interrupted_session()
+            if session is not None:
+                return await provider.send_followup(session, interrupt_result.guidance)
+
+        # Fallback: re-execute the agent with guidance appended to prompt
+        new_guidance_section = self.context.get_guidance_prompt_section()
+        return await executor.execute(agent, agent_context, guidance_section=new_guidance_section)
+
+    async def _execute_loop(self, current_agent_name: str) -> dict[str, Any]:
+        """Core execution loop shared by :meth:`run` and :meth:`resume`.
+
+        Iterates through agents following routing rules until ``$end`` is
+        reached.  On failure the current state is saved to a checkpoint
+        file (if ``workflow_path`` is set) and the original exception is
+        re-raised.
+
+        Args:
+            current_agent_name: Name of the first agent to execute.
+
+        Returns:
+            Final output dict built from output templates.
+        """
         try:
             async with self.limits.timeout_context():
+                # Emit workflow_started before the execution loop
+                self._emit(
+                    "workflow_started",
+                    {
+                        "name": self.config.workflow.name,
+                        "entry_point": self.config.workflow.entry_point,
+                        "agents": [
+                            {
+                                "name": a.name,
+                                "type": a.type or "agent",
+                                "model": a.model,
+                            }
+                            for a in self.config.agents
+                        ],
+                        "parallel_groups": [
+                            {
+                                "name": p.name,
+                                "agents": p.agents,
+                            }
+                            for p in self.config.parallel
+                        ],
+                        "for_each_groups": [
+                            {
+                                "name": f.name,
+                                "source": f.source,
+                            }
+                            for f in self.config.for_each
+                        ],
+                        "routes": [
+                            {
+                                "from": a.name,
+                                "to": r.to,
+                                "when": r.when,
+                            }
+                            for a in self.config.agents
+                            for r in a.routes
+                        ]
+                        + [
+                            {
+                                "from": p.name,
+                                "to": r.to,
+                                "when": r.when,
+                            }
+                            for p in self.config.parallel
+                            for r in p.routes
+                        ]
+                        + [
+                            {
+                                "from": f.name,
+                                "to": r.to,
+                                "when": r.when,
+                            }
+                            for f in self.config.for_each
+                            for r in f.routes
+                        ],
+                    },
+                )
+
+                _workflow_start = _time.time()
+
                 while True:
+                    self._current_agent_name = current_agent_name
+
                     # Try to find agent, parallel group, or for-each group
                     agent = self._find_agent(current_agent_name)
                     parallel_group = self._find_parallel_group(current_agent_name)
@@ -603,8 +999,23 @@ class WorkflowEngine:
                         # Verbose: Log routing decision
                         _verbose_log_route(route_result.target)
 
+                        self._emit(
+                            "route_taken",
+                            {
+                                "from_agent": for_each_group.name,
+                                "to_agent": route_result.target,
+                            },
+                        )
+
                         if route_result.target == "$end":
                             result = self._build_final_output(route_result.output_transform)
+                            self._emit(
+                                "workflow_completed",
+                                {
+                                    "elapsed": _time.time() - _workflow_start,
+                                    "output": result,
+                                },
+                            )
                             self._execute_hook("on_complete", result=result)
                             return result
 
@@ -676,8 +1087,23 @@ class WorkflowEngine:
                         # Verbose: Log routing decision
                         _verbose_log_route(route_result.target)
 
+                        self._emit(
+                            "route_taken",
+                            {
+                                "from_agent": parallel_group.name,
+                                "to_agent": route_result.target,
+                            },
+                        )
+
                         if route_result.target == "$end":
                             result = self._build_final_output(route_result.output_transform)
+                            self._emit(
+                                "workflow_completed",
+                                {
+                                    "elapsed": _time.time() - _workflow_start,
+                                    "output": result,
+                                },
+                            )
                             self._execute_hook("on_complete", result=result)
                             return result
 
@@ -692,6 +1118,15 @@ class WorkflowEngine:
                         iteration = self.limits.current_iteration + 1
                         _verbose_log_agent_start(current_agent_name, iteration)
 
+                        self._emit(
+                            "agent_started",
+                            {
+                                "agent_name": agent.name,
+                                "iteration": iteration,
+                                "agent_type": agent.type or "agent",
+                            },
+                        )
+
                         # Trim context if max_tokens is configured
                         self._trim_context_if_needed()
 
@@ -700,9 +1135,28 @@ class WorkflowEngine:
                             # Build context for the gate prompt
                             agent_context = self.context.get_for_template()
 
+                            self._emit(
+                                "gate_presented",
+                                {
+                                    "agent_name": agent.name,
+                                    "options": [o.value for o in (agent.options or [])],
+                                    "prompt": self.renderer.render(agent.prompt, agent_context),
+                                },
+                            )
+
                             # Use the gate handler for interaction
                             gate_result: GateResult = await self.gate_handler.handle_gate(
                                 agent, agent_context
+                            )
+
+                            self._emit(
+                                "gate_resolved",
+                                {
+                                    "agent_name": agent.name,
+                                    "selected_option": gate_result.selected_option.value,
+                                    "route": gate_result.route,
+                                    "additional_input": gate_result.additional_input,
+                                },
                             )
 
                             # Store gate result in context
@@ -719,9 +1173,105 @@ class WorkflowEngine:
 
                             if gate_result.route == "$end":
                                 result = self._build_final_output()
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
                                 self._execute_hook("on_complete", result=result)
                                 return result
                             current_agent_name = gate_result.route
+                            continue
+
+                        # Handle script steps
+                        if agent.type == "script":
+                            agent_context = self.context.build_for_agent(
+                                agent.name,
+                                agent.input,
+                                mode=self.config.workflow.context.mode,
+                            )
+                            _script_start = _time.time()
+
+                            self._emit(
+                                "script_started",
+                                {
+                                    "agent_name": agent.name,
+                                    "iteration": self.limits.current_iteration + 1,
+                                },
+                            )
+
+                            try:
+                                script_output = await self._execute_script(agent, agent_context)
+                            except Exception as exc:
+                                _script_elapsed = _time.time() - _script_start
+                                self._emit(
+                                    "script_failed",
+                                    {
+                                        "agent_name": agent.name,
+                                        "elapsed": _script_elapsed,
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                                raise
+                            _script_elapsed = _time.time() - _script_start
+
+                            _verbose_log_agent_complete(agent.name, _script_elapsed)
+
+                            self._emit(
+                                "script_completed",
+                                {
+                                    "agent_name": agent.name,
+                                    "elapsed": _script_elapsed,
+                                    "stdout": script_output.stdout,
+                                    "stderr": script_output.stderr,
+                                    "exit_code": script_output.exit_code,
+                                },
+                            )
+
+                            # Store structured output in context
+                            output_content = {
+                                "stdout": script_output.stdout,
+                                "stderr": script_output.stderr,
+                                "exit_code": script_output.exit_code,
+                            }
+                            self.context.store(agent.name, output_content)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            route_result = self._evaluate_routes(agent, output_content)
+                            _verbose_log_route(route_result.target)
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                self._execute_hook("on_complete", result=result)
+                                return result
+
+                            current_agent_name = route_result.target
+
+                            # Check for interrupt after script step
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
                             continue
 
                         # Build context for this agent
@@ -734,8 +1284,28 @@ class WorkflowEngine:
                         # Execute agent (get executor for multi-provider support)
                         _agent_start = _time.time()
                         executor = await self._get_executor_for_agent(agent)
-                        output = await executor.execute(agent, agent_context)
+                        guidance_section = self.context.get_guidance_prompt_section()
+                        event_callback = self._make_event_callback(agent.name)
+                        output = await executor.execute(
+                            agent,
+                            agent_context,
+                            guidance_section=guidance_section,
+                            interrupt_signal=self._interrupt_event,
+                            event_callback=event_callback,
+                        )
                         _agent_elapsed = _time.time() - _agent_start
+
+                        # Handle mid-agent interrupt (partial output)
+                        if output.partial:
+                            output = await self._handle_partial_output(
+                                agent,
+                                output,
+                                agent_context,
+                                guidance_section,
+                                executor,
+                                _agent_start,
+                            )
+                            _agent_elapsed = _time.time() - _agent_start
 
                         # Record usage and calculate cost
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
@@ -755,6 +1325,21 @@ class WorkflowEngine:
                             output_tokens=output.output_tokens,
                         )
 
+                        self._emit(
+                            "agent_completed",
+                            {
+                                "agent_name": agent.name,
+                                "elapsed": _agent_elapsed,
+                                "model": output.model,
+                                "tokens": output.tokens_used,
+                                "input_tokens": output.input_tokens,
+                                "output_tokens": output.output_tokens,
+                                "cost_usd": usage.cost_usd,
+                                "output": output.content,
+                                "output_keys": output_keys,
+                            },
+                        )
+
                         # Store output
                         self.context.store(agent.name, output.content)
 
@@ -770,20 +1355,63 @@ class WorkflowEngine:
                         # Verbose: Log routing decision
                         _verbose_log_route(route_result.target)
 
+                        self._emit(
+                            "route_taken",
+                            {
+                                "from_agent": agent.name,
+                                "to_agent": route_result.target,
+                            },
+                        )
+
                         if route_result.target == "$end":
                             result = self._build_final_output(route_result.output_transform)
+                            self._emit(
+                                "workflow_completed",
+                                {
+                                    "elapsed": _time.time() - _workflow_start,
+                                    "output": result,
+                                },
+                            )
                             self._execute_hook("on_complete", result=result)
                             return result
 
                         current_agent_name = route_result.target
 
+                    # Check for interrupt between agents (deferred for parallel/for-each)
+                    interrupt_result = await self._check_interrupt(current_agent_name)
+                    if interrupt_result is not None:
+                        current_agent_name = await self._handle_interrupt_result(
+                            interrupt_result, current_agent_name
+                        )
+
+        except KeyboardInterrupt:
+            self._save_checkpoint_on_failure(KeyboardInterrupt("Workflow interrupted by user"))
+            raise
         except ConductorError as e:
+            self._emit(
+                "workflow_failed",
+                {
+                    "error_type": type(e).__name__,
+                    "message": str(e),
+                    "agent_name": self._current_agent_name,
+                },
+            )
             # Execute on_error hook with error information
             self._execute_hook("on_error", error=e)
+            self._save_checkpoint_on_failure(e)
             raise
         except Exception as e:
+            self._emit(
+                "workflow_failed",
+                {
+                    "error_type": type(e).__name__,
+                    "message": str(e),
+                    "agent_name": self._current_agent_name,
+                },
+            )
             # Execute on_error hook for unexpected errors
             self._execute_hook("on_error", error=e)
+            self._save_checkpoint_on_failure(e)
             raise
 
     def _apply_input_defaults(self, inputs: dict[str, Any]) -> dict[str, Any]:
@@ -1180,6 +1808,14 @@ class WorkflowEngine:
         # Verbose: Log parallel group start
         _verbose_log_parallel_start(parallel_group.name, len(parallel_group.agents))
 
+        self._emit(
+            "parallel_started",
+            {
+                "group_name": parallel_group.name,
+                "agents": parallel_group.agents,
+            },
+        )
+
         # Track timing for summary
         _group_start = _time.time()
 
@@ -1218,7 +1854,12 @@ class WorkflowEngine:
 
                 # Execute agent (get executor for multi-provider support)
                 executor = await self._get_executor_for_agent(agent)
-                output = await executor.execute(agent, agent_context)
+                event_callback = self._make_event_callback(agent.name)
+                output = await executor.execute(
+                    agent,
+                    agent_context,
+                    event_callback=event_callback,
+                )
                 _agent_elapsed = _time.time() - _agent_start
 
                 # Record usage and calculate cost
@@ -1233,6 +1874,18 @@ class WorkflowEngine:
                     cost_usd=usage.cost_usd,
                 )
 
+                self._emit(
+                    "parallel_agent_completed",
+                    {
+                        "group_name": parallel_group.name,
+                        "agent_name": agent.name,
+                        "elapsed": _agent_elapsed,
+                        "model": output.model,
+                        "tokens": output.tokens_used,
+                        "cost_usd": usage.cost_usd,
+                    },
+                )
+
                 # Individual parallel agents are counted toward iteration limit
                 # at the parallel group level after all agents complete
                 return (agent.name, output.content)
@@ -1245,6 +1898,17 @@ class WorkflowEngine:
                     _agent_elapsed,
                     type(e).__name__,
                     str(e),
+                )
+
+                self._emit(
+                    "parallel_agent_failed",
+                    {
+                        "group_name": parallel_group.name,
+                        "agent_name": agent.name,
+                        "elapsed": _agent_elapsed,
+                        "error_type": type(e).__name__,
+                        "message": str(e),
+                    },
                 )
 
                 # Wrap exception with agent name and timing for better error reporting
@@ -1299,6 +1963,15 @@ class WorkflowEngine:
                     len(parallel_output.errors),
                     _group_elapsed,
                 )
+                self._emit(
+                    "parallel_completed",
+                    {
+                        "group_name": parallel_group.name,
+                        "success_count": len(parallel_output.outputs),
+                        "failure_count": len(parallel_output.errors),
+                        "elapsed": _group_elapsed,
+                    },
+                )
 
         elif parallel_group.failure_mode == "continue_on_error":
             # Collect all results and exceptions
@@ -1333,6 +2006,15 @@ class WorkflowEngine:
                 len(parallel_output.outputs),
                 len(parallel_output.errors),
                 _group_elapsed,
+            )
+            self._emit(
+                "parallel_completed",
+                {
+                    "group_name": parallel_group.name,
+                    "success_count": len(parallel_output.outputs),
+                    "failure_count": len(parallel_output.errors),
+                    "elapsed": _group_elapsed,
+                },
             )
 
             # Fail if ALL agents failed
@@ -1385,6 +2067,15 @@ class WorkflowEngine:
                 len(parallel_output.outputs),
                 len(parallel_output.errors),
                 _group_elapsed,
+            )
+            self._emit(
+                "parallel_completed",
+                {
+                    "group_name": parallel_group.name,
+                    "success_count": len(parallel_output.outputs),
+                    "failure_count": len(parallel_output.errors),
+                    "elapsed": _group_elapsed,
+                },
             )
 
             # Fail if ANY agent failed
@@ -1480,6 +2171,16 @@ class WorkflowEngine:
             for_each_group.failure_mode,
         )
 
+        self._emit(
+            "for_each_started",
+            {
+                "group_name": for_each_group.name,
+                "item_count": len(items),
+                "max_concurrent": for_each_group.max_concurrent,
+                "failure_mode": for_each_group.failure_mode,
+            },
+        )
+
         # Track timing for summary
         _group_start = _time.time()
 
@@ -1505,6 +2206,16 @@ class WorkflowEngine:
                 Exception: Any exception from agent execution (wrapped with metadata).
             """
             _item_start = _time.time()
+
+            self._emit(
+                "for_each_item_started",
+                {
+                    "group_name": for_each_group.name,
+                    "item_key": key,
+                    "index": index,
+                },
+            )
+
             try:
                 # Build context for this item using the snapshot
                 agent_context = context_snapshot.build_for_agent(
@@ -1524,7 +2235,12 @@ class WorkflowEngine:
 
                 # Execute agent with injected context (get executor for multi-provider)
                 executor = await self._get_executor_for_agent(for_each_group.agent)
-                output = await executor.execute(for_each_group.agent, agent_context)
+                event_callback = self._make_event_callback(for_each_group.name)
+                output = await executor.execute(
+                    for_each_group.agent,
+                    agent_context,
+                    event_callback=event_callback,
+                )
                 _item_elapsed = _time.time() - _item_start
 
                 # Record usage and calculate cost
@@ -1540,6 +2256,17 @@ class WorkflowEngine:
                     cost_usd=usage.cost_usd,
                 )
 
+                self._emit(
+                    "for_each_item_completed",
+                    {
+                        "group_name": for_each_group.name,
+                        "item_key": key,
+                        "elapsed": _item_elapsed,
+                        "tokens": output.tokens_used,
+                        "cost_usd": usage.cost_usd,
+                    },
+                )
+
                 return (key, output.content)
             except Exception as e:
                 _item_elapsed = _time.time() - _item_start
@@ -1550,6 +2277,17 @@ class WorkflowEngine:
                     _item_elapsed,
                     type(e).__name__,
                     str(e),
+                )
+
+                self._emit(
+                    "for_each_item_failed",
+                    {
+                        "group_name": for_each_group.name,
+                        "item_key": key,
+                        "elapsed": _item_elapsed,
+                        "error_type": type(e).__name__,
+                        "message": str(e),
+                    },
                 )
 
                 # Attach metadata for error reporting
@@ -1691,6 +2429,15 @@ class WorkflowEngine:
             success_count,
             failure_count,
             _group_elapsed,
+        )
+        self._emit(
+            "for_each_completed",
+            {
+                "group_name": for_each_group.name,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "elapsed": _group_elapsed,
+            },
         )
 
         # Apply failure mode policy (for continue_on_error and all_or_nothing)

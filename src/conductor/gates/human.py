@@ -6,6 +6,7 @@ for user selection via Rich interactive prompts.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -146,14 +147,19 @@ class HumanGateHandler:
         for i, option in enumerate(options, 1):
             self.console.print(f"  [cyan][{i}][/cyan] {option.label}")
 
-        # Get user selection
+        # Get user selection — run in thread to avoid blocking the event loop
+        # (blocking here prevents the web dashboard from updating)
         valid_choices = [str(i) for i in range(1, len(options) + 1)]
         while True:
-            choice = Prompt.ask(
-                "\n[bold]Select option[/bold]",
-                choices=valid_choices,
-                show_choices=True,
-            )
+
+            def _ask_choice() -> str:
+                return Prompt.ask(
+                    "\n[bold]Select option[/bold]",
+                    choices=valid_choices,
+                    show_choices=True,
+                )
+
+            choice = await asyncio.to_thread(_ask_choice)
             try:
                 index = int(choice) - 1
                 if 0 <= index < len(options):
@@ -178,7 +184,11 @@ class HumanGateHandler:
         """
         self.console.print()
         self.console.print(f"[bold]Please provide {field_name}:[/bold]")
-        value = Prompt.ask(f"  {field_name}")
+
+        def _ask_value() -> str:
+            return Prompt.ask(f"  {field_name}")
+
+        value = await asyncio.to_thread(_ask_value)
         return {field_name: value}
 
     def _auto_select(self, option: GateOption) -> GateResult:
@@ -350,10 +360,14 @@ class MaxIterationsHandler:
         """
         self.console.print()
         try:
-            value = IntPrompt.ask(
-                "[bold]How many more iterations would you like to allow?[/bold]",
-                default=0,
-            )
+
+            def _ask_int() -> int:
+                return IntPrompt.ask(
+                    "[bold]How many more iterations would you like to allow?[/bold]",
+                    default=0,
+                )
+
+            value = await asyncio.to_thread(_ask_int)
             return max(0, value)  # Ensure non-negative
         except (ValueError, KeyboardInterrupt):
             return 0

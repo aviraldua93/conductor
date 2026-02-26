@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ProviderError
-from conductor.providers.base import AgentOutput, AgentProvider
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef
@@ -89,6 +89,7 @@ class SDKResponse:
         output_tokens: Number of output tokens generated (from assistant.usage event).
         cache_read_tokens: Tokens read from cache (if available).
         cache_write_tokens: Tokens written to cache (if available).
+        partial: Whether this response is partial (from a mid-agent interrupt).
     """
 
     content: str
@@ -96,6 +97,7 @@ class SDKResponse:
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    partial: bool = False
 
 
 class CopilotProvider(AgentProvider):
@@ -156,6 +158,10 @@ class CopilotProvider(AgentProvider):
         self._started = False
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
+        self._session_ids: dict[str, str] = {}
+        self._resume_session_ids: dict[str, str] = {}
+        self._interrupted_session: Any = None
+        self._abort_supported: bool | None = None
 
     async def execute(
         self,
@@ -163,6 +169,8 @@ class CopilotProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
 
@@ -174,6 +182,10 @@ class CopilotProvider(AgentProvider):
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+                When set during execution, the provider will attempt to abort
+                the current session and return partial output.
+            event_callback: Optional callback for streaming SDK events upstream.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -197,7 +209,14 @@ class CopilotProvider(AgentProvider):
         logger.debug(f"Prompt length: {len(rendered_prompt)} chars, Tools: {tools}")
 
         # Use retry logic for both mock and real SDK calls
-        return await self._execute_with_retry(agent, context, rendered_prompt, tools)
+        return await self._execute_with_retry(
+            agent,
+            context,
+            rendered_prompt,
+            tools,
+            interrupt_signal=interrupt_signal,
+            event_callback=event_callback,
+        )
 
     async def _execute_with_retry(
         self,
@@ -205,6 +224,8 @@ class CopilotProvider(AgentProvider):
         context: dict[str, Any],
         rendered_prompt: str,
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute with exponential backoff retry logic.
 
@@ -213,6 +234,8 @@ class CopilotProvider(AgentProvider):
             context: Accumulated workflow context.
             rendered_prompt: Jinja2-rendered user prompt.
             tools: List of tool names available to this agent.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+            event_callback: Optional callback for streaming SDK events upstream.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -226,7 +249,12 @@ class CopilotProvider(AgentProvider):
         for attempt in range(1, config.max_attempts + 1):
             try:
                 content, sdk_response = await self._execute_sdk_call(
-                    agent, rendered_prompt, context, tools
+                    agent,
+                    rendered_prompt,
+                    context,
+                    tools,
+                    interrupt_signal=interrupt_signal,
+                    event_callback=event_callback,
                 )
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
@@ -237,6 +265,9 @@ class CopilotProvider(AgentProvider):
                 if input_tokens is not None and output_tokens is not None:
                     tokens_used = input_tokens + output_tokens
 
+                # Detect partial result from mid-agent interrupt
+                is_partial = sdk_response.partial if sdk_response else False
+
                 return AgentOutput(
                     content=content,
                     raw_response=json.dumps(content),
@@ -246,6 +277,7 @@ class CopilotProvider(AgentProvider):
                     cache_read_tokens=cache_read,
                     cache_write_tokens=cache_write,
                     model=agent.model or self._default_model,
+                    partial=is_partial,
                 )
             except ProviderError as e:
                 last_error = e
@@ -316,6 +348,8 @@ class CopilotProvider(AgentProvider):
         rendered_prompt: str,
         context: dict[str, Any],
         tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> tuple[dict[str, Any], SDKResponse | None]:
         """Execute the actual SDK call or mock handler.
 
@@ -324,6 +358,8 @@ class CopilotProvider(AgentProvider):
             rendered_prompt: Jinja2-rendered user prompt.
             context: Accumulated workflow context.
             tools: List of tool names available to this agent.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+            event_callback: Optional callback for streaming SDK events upstream.
 
         Returns:
             Tuple of (content dict, SDKResponse with usage data or None for mock).
@@ -385,8 +421,28 @@ class CopilotProvider(AgentProvider):
             if self._mcp_servers:
                 session_config["mcp_servers"] = self._mcp_servers
 
-            # Create a session and send the prompt
-            session = await self._client.create_session(session_config)
+            # Attempt to resume a previous session if one exists for this agent
+            session: Any = None
+            resume_sid = self._resume_session_ids.get(agent.name)
+            if resume_sid is not None:
+                try:
+                    session = await self._client.resume_session(resume_sid)
+                    logger.info(f"Resumed Copilot session {resume_sid} for agent '{agent.name}'")
+                except Exception as exc:
+                    logger.warning(
+                        f"Could not resume session {resume_sid} for agent "
+                        f"'{agent.name}': {exc}. Falling back to new session."
+                    )
+                    session = None
+
+            # Fall back to creating a new session
+            if session is None:
+                session = await self._client.create_session(session_config)
+
+            # Track session ID for checkpoint persistence
+            sid = getattr(session, "session_id", None)
+            if sid is not None:
+                self._session_ids[agent.name] = sid
 
             # Capture verbose state before callback (contextvars don't propagate to sync callbacks)
             from conductor.cli.app import is_full, is_verbose
@@ -394,12 +450,38 @@ class CopilotProvider(AgentProvider):
             verbose_enabled = is_verbose()
             full_enabled = is_full()
 
+            session_destroyed = False
             try:
                 # Send initial prompt and get response
                 sdk_response = await self._send_and_wait(
-                    session, full_prompt, verbose_enabled, full_enabled
+                    session,
+                    full_prompt,
+                    verbose_enabled,
+                    full_enabled,
+                    interrupt_signal=interrupt_signal,
+                    event_callback=event_callback,
                 )
                 response_content = sdk_response.content
+
+                # Handle mid-agent interrupt: return partial content
+                # and keep session alive for follow-up
+                if sdk_response.partial:
+                    self._interrupted_session = session
+                    session_destroyed = True  # Prevent finally from destroying it
+                    partial_content: dict[str, Any]
+                    try:
+                        partial_content = self._extract_json(response_content)
+                    except (json.JSONDecodeError, ValueError):
+                        partial_content = {"result": response_content}
+                    partial_usage = SDKResponse(
+                        content=response_content,
+                        input_tokens=sdk_response.input_tokens,
+                        output_tokens=sdk_response.output_tokens,
+                        cache_read_tokens=sdk_response.cache_read_tokens,
+                        cache_write_tokens=sdk_response.cache_write_tokens,
+                        partial=True,
+                    )
+                    return partial_content, partial_usage
 
                 # Track cumulative usage across potential recovery calls
                 total_input_tokens = sdk_response.input_tokens
@@ -483,8 +565,9 @@ class CopilotProvider(AgentProvider):
                 )
 
             finally:
-                # Always destroy session when done
-                await session.destroy()
+                # Destroy session unless it was kept alive for follow-up
+                if not session_destroyed:
+                    await session.destroy()
 
         except ProviderError:
             raise
@@ -501,6 +584,8 @@ class CopilotProvider(AgentProvider):
         prompt: str,
         verbose_enabled: bool,
         full_enabled: bool,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -509,9 +594,14 @@ class CopilotProvider(AgentProvider):
             prompt: The prompt to send.
             verbose_enabled: Whether verbose logging is enabled.
             full_enabled: Whether full logging mode is enabled.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+                When set, the method will attempt to abort the session and
+                return partial content with ``partial=True``.
+            event_callback: Optional callback for streaming SDK events upstream.
 
         Returns:
-            SDKResponse with content and usage data.
+            SDKResponse with content and usage data. If interrupted,
+            ``SDKResponse.partial`` will be True.
 
         Raises:
             ProviderError: If an error occurs during the SDK call or session gets stuck.
@@ -564,6 +654,10 @@ class CopilotProvider(AgentProvider):
                 )
                 last_activity_ref[1] = tool_name
 
+            # Forward structured events upstream via event_callback
+            if event_callback is not None:
+                self._forward_event(event_type, event, event_callback)
+
             # Verbose logging for intermediate progress
             if verbose_enabled:
                 self._log_event_verbose(event_type, event, full_enabled)
@@ -571,10 +665,31 @@ class CopilotProvider(AgentProvider):
         session.on(on_event)
         await session.send({"prompt": prompt})
 
-        # Wait with idle detection and recovery
-        await self._wait_with_idle_detection(
-            done, session, verbose_enabled, full_enabled, last_activity_ref
-        )
+        # If interrupt_signal is provided, race between done and interrupt
+        if interrupt_signal is not None:
+            was_interrupted = await self._wait_with_interrupt(
+                done,
+                session,
+                interrupt_signal,
+                last_activity_ref,
+                verbose_enabled,
+                full_enabled,
+            )
+            if was_interrupted:
+                # Return partial content (don't check error_message for partial)
+                return SDKResponse(
+                    content=response_content,
+                    input_tokens=usage_ref[0],
+                    output_tokens=usage_ref[1],
+                    cache_read_tokens=usage_ref[2],
+                    cache_write_tokens=usage_ref[3],
+                    partial=True,
+                )
+        else:
+            # Wait with idle detection and recovery (original path)
+            await self._wait_with_idle_detection(
+                done, session, verbose_enabled, full_enabled, last_activity_ref
+            )
 
         if error_message:
             raise ProviderError(
@@ -589,6 +704,165 @@ class CopilotProvider(AgentProvider):
             cache_read_tokens=usage_ref[2],
             cache_write_tokens=usage_ref[3],
         )
+
+    async def _wait_with_interrupt(
+        self,
+        done: asyncio.Event,
+        session: Any,
+        interrupt_signal: asyncio.Event,
+        last_activity_ref: list[Any],
+        verbose_enabled: bool,
+        full_enabled: bool,
+    ) -> bool:
+        """Wait for session completion or interrupt signal, whichever comes first.
+
+        If the interrupt signal fires first, attempts to abort the session
+        and waits briefly for a post-abort event (idle or error) before
+        returning.
+
+        Args:
+            done: Event that signals session completion.
+            session: The Copilot SDK session.
+            interrupt_signal: Event that signals a user interrupt request.
+            last_activity_ref: Mutable [last_event_type, last_tool_call, timestamp].
+            verbose_enabled: Whether verbose logging is enabled.
+            full_enabled: Whether full logging mode is enabled.
+
+        Returns:
+            True if interrupted, False if completed normally.
+        """
+        # Create tasks for both events
+        done_waiter = asyncio.create_task(done.wait())
+        interrupt_waiter = asyncio.create_task(interrupt_signal.wait())
+
+        try:
+            finished, pending = await asyncio.wait(
+                {done_waiter, interrupt_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+            if interrupt_waiter in finished:
+                # Interrupt fired — attempt to abort the session
+                interrupt_signal.clear()
+                logger.info("Mid-agent interrupt received, attempting session abort")
+                await self._abort_session(session, done)
+                return True
+
+            # Normal completion
+            return False
+
+        except Exception:
+            # Cleanup on unexpected error
+            for t in (done_waiter, interrupt_waiter):
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+            raise
+
+    async def _abort_session(self, session: Any, done: asyncio.Event) -> None:
+        """Attempt to abort a Copilot SDK session.
+
+        Tries ``session.abort()`` first, then falls back to a raw RPC
+        call. After aborting, waits up to 5 seconds for a post-abort
+        event (session.idle or error).
+
+        Args:
+            session: The Copilot SDK session to abort.
+            done: Event that signals session completion (may be set by
+                post-abort events).
+        """
+        # Skip abort if previously determined to be unsupported
+        if self._abort_supported is False:
+            logger.debug("Skipping abort — previously detected as unsupported")
+            return
+
+        abort_called = False
+
+        # Try method-based abort first
+        if hasattr(session, "abort") and callable(session.abort):
+            try:
+                await session.abort()
+                abort_called = True
+                logger.debug("Session aborted via session.abort()")
+            except Exception as exc:
+                logger.warning(f"session.abort() failed: {exc}")
+
+        # Fallback to raw RPC if abort method not available or failed
+        if not abort_called and hasattr(session, "rpc"):
+            try:
+                await session.rpc("session/abort", {})
+                abort_called = True
+                logger.debug("Session aborted via raw RPC")
+            except Exception as exc:
+                logger.warning(f"RPC abort failed: {exc}")
+
+        if not abort_called:
+            logger.warning("Could not abort session — abort capability not available")
+            self._abort_supported = False
+            return
+
+        self._abort_supported = True
+
+        # Wait briefly for post-abort event (idle or error)
+        try:
+            await asyncio.wait_for(done.wait(), timeout=5.0)
+        except TimeoutError:
+            logger.debug("Post-abort wait timed out after 5s")
+
+    async def send_followup(self, session: Any, guidance: str) -> AgentOutput:
+        """Send follow-up guidance to an interrupted session.
+
+        After a mid-agent interrupt, the session is kept alive so that
+        the user's guidance can be sent as a follow-up message. This
+        method sends the guidance, waits for the response, and then
+        destroys the session.
+
+        Args:
+            session: The Copilot SDK session handle (kept alive after interrupt).
+            guidance: User-provided guidance text to send as follow-up.
+
+        Returns:
+            AgentOutput with the follow-up response content.
+        """
+        from conductor.cli.app import is_full, is_verbose
+
+        verbose_enabled = is_verbose()
+        full_enabled = is_full()
+
+        try:
+            sdk_response = await self._send_and_wait(
+                session, guidance, verbose_enabled, full_enabled
+            )
+
+            content: dict[str, Any]
+            try:
+                content = self._extract_json(sdk_response.content)
+            except (json.JSONDecodeError, ValueError):
+                content = {"result": sdk_response.content}
+
+            tokens_used = None
+            if sdk_response.input_tokens is not None and sdk_response.output_tokens is not None:
+                tokens_used = sdk_response.input_tokens + sdk_response.output_tokens
+
+            return AgentOutput(
+                content=content,
+                raw_response=sdk_response.content,
+                tokens_used=tokens_used,
+                input_tokens=sdk_response.input_tokens,
+                output_tokens=sdk_response.output_tokens,
+                cache_read_tokens=sdk_response.cache_read_tokens,
+                cache_write_tokens=sdk_response.cache_write_tokens,
+                model=self._default_model,
+            )
+        finally:
+            await session.destroy()
 
     def _log_parse_recovery(
         self,
@@ -726,14 +1000,16 @@ class CopilotProvider(AgentProvider):
 
         # Log interesting events with Rich styling
         if event_type == "tool.execution_start":
-            tool_name = getattr(event.data, "tool_name", None) or getattr(
-                event.data, "name", "unknown"
+            tool_name = (
+                getattr(event.data, "tool_name", None)
+                or getattr(event.data, "name", None)
+                or "unknown"
             )
 
             text = Text()
             text.append("    ├─ ", style="dim")
             text.append("🔧 ", style="")
-            text.append(tool_name, style="cyan bold")
+            text.append(str(tool_name), style="cyan bold")
             _print(text)
 
             # In full mode, try to show arguments
@@ -755,7 +1031,7 @@ class CopilotProvider(AgentProvider):
                 text = Text()
                 text.append("    │  ", style="dim")
                 text.append("✓ ", style="green")
-                text.append(tool_name, style="dim")
+                text.append(str(tool_name), style="dim")
                 _print(text)
 
             # In full mode, try to show result preview
@@ -790,16 +1066,16 @@ class CopilotProvider(AgentProvider):
                     _print(text)
 
         elif event_type == "subagent.started":
-            agent_name = getattr(event.data, "name", "unknown")
+            agent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    ├─ ", style="dim")
             text.append("🤖 ", style="")
             text.append("Sub-agent: ", style="dim")
-            text.append(agent_name, style="magenta bold")
+            text.append(str(agent_name), style="magenta bold")
             _print(text)
 
         elif event_type == "subagent.completed":
-            agent_name = getattr(event.data, "name", "unknown")
+            agent_name = getattr(event.data, "name", None) or "unknown"
             text = Text()
             text.append("    │  ", style="dim")
             text.append("✓ ", style="green")
@@ -816,6 +1092,67 @@ class CopilotProvider(AgentProvider):
                 text.append("⏳ ", style="yellow")
                 text.append(f"Processing{turn_info}...", style="dim italic")
                 _print(text)
+
+    @staticmethod
+    def _forward_event(event_type: str, event: Any, callback: EventCallback) -> None:
+        """Forward an SDK event to an upstream callback as a structured dict.
+
+        Maps SDK event types to Conductor streaming event types and extracts
+        relevant data from each event.
+
+        Args:
+            event_type: The raw SDK event type string.
+            event: The SDK event object.
+            callback: The upstream callback to invoke with (event_type, data).
+        """
+        try:
+            if event_type == "assistant.reasoning":
+                content = getattr(event.data, "content", "")
+                if content:
+                    callback("agent_reasoning", {"content": content})
+
+            elif event_type == "tool.execution_start":
+                tool_name = (
+                    getattr(event.data, "tool_name", None)
+                    or getattr(event.data, "name", None)
+                    or "unknown"
+                )
+                arguments = getattr(event.data, "arguments", None) or getattr(
+                    event.data, "args", None
+                )
+                callback(
+                    "agent_tool_start",
+                    {
+                        "tool_name": str(tool_name),
+                        "arguments": str(arguments)[:500] if arguments else None,
+                    },
+                )
+
+            elif event_type == "tool.execution_complete":
+                tool_name = getattr(event.data, "tool_name", None) or getattr(
+                    event.data, "name", None
+                )
+                result = getattr(event.data, "result", None) or getattr(event.data, "output", None)
+                callback(
+                    "agent_tool_complete",
+                    {
+                        "tool_name": str(tool_name) if tool_name else None,
+                        "result": str(result)[:500] if result else None,
+                    },
+                )
+
+            elif event_type == "assistant.turn_start":
+                turn = getattr(event.data, "turn", None)
+                callback("agent_turn_start", {"turn": turn})
+
+            elif event_type == "assistant.message":
+                content = getattr(event.data, "content", "")
+                if content:
+                    callback("agent_message", {"content": content})
+
+        except Exception:
+            # Never let callback errors break the SDK event loop
+            logger.debug("Error forwarding event %s to callback", event_type, exc_info=True)
 
     def _build_recovery_prompt(
         self,
@@ -927,18 +1264,34 @@ class CopilotProvider(AgentProvider):
             ProviderError: If all recovery attempts are exhausted.
         """
         recovery_attempts = 0
+        idle_timeout = self._idle_recovery_config.idle_timeout_seconds
 
         while True:
             try:
                 # Wait for done with idle timeout
                 await asyncio.wait_for(
                     done.wait(),
-                    timeout=self._idle_recovery_config.idle_timeout_seconds,
+                    timeout=idle_timeout,
                 )
                 return  # Completed successfully
 
             except TimeoutError as e:
-                # No activity for idle_timeout_seconds - attempt recovery
+                # Timeout fired — but check if events were recently received.
+                # The agent may be actively working (tool calls, reasoning) without
+                # having reached session.idle yet. Only consider it stuck if no
+                # events at all arrived within the idle timeout window.
+                last_event_time = last_activity_ref[2]
+                time_since_last_event = time.monotonic() - last_event_time
+
+                if time_since_last_event < idle_timeout:
+                    # Events are still flowing — the agent is actively working,
+                    # just hasn't finished yet. Reset recovery counter (new task)
+                    # and keep waiting.
+                    recovery_attempts = 0
+                    done.clear()
+                    continue
+
+                # Genuinely idle — no events for the full timeout period
                 recovery_attempts += 1
 
                 last_event_type = last_activity_ref[0]
@@ -952,7 +1305,7 @@ class CopilotProvider(AgentProvider):
                         f"{stuck_info}",
                         suggestion=(
                             f"The agent did not respond for "
-                            f"{self._idle_recovery_config.idle_timeout_seconds}s "
+                            f"{idle_timeout}s "
                             "despite recovery prompts. This may indicate a persistent issue "
                             "with the SDK, network connection, or the agent's ability to "
                             "complete the task. Enable --log-file to capture full debug output."
@@ -1084,6 +1437,41 @@ class CopilotProvider(AgentProvider):
         self._started = False
         self._call_history.clear()
         self._retry_history.clear()
+
+    def get_session_ids(self) -> dict[str, str]:
+        """Get tracked session IDs for all executed agents.
+
+        Returns a copy of the mapping from agent name to Copilot session ID.
+        Session IDs are captured after ``create_session()`` and remain valid
+        even after ``session.destroy()`` (which only releases local resources).
+
+        Returns:
+            Dict mapping agent names to their Copilot session IDs.
+        """
+        return self._session_ids.copy()
+
+    def set_resume_session_ids(self, ids: dict[str, str]) -> None:
+        """Set session IDs to attempt resuming on next execution.
+
+        When executing an agent, the provider will check this mapping
+        for a stored session ID and attempt ``client.resume_session()``
+        before falling back to ``create_session()``.
+
+        Args:
+            ids: Mapping of agent names to session IDs from a checkpoint.
+        """
+        self._resume_session_ids = dict(ids)
+
+    def get_interrupted_session(self) -> Any | None:
+        """Get the session handle kept alive after a mid-agent interrupt.
+
+        Returns:
+            The Copilot SDK session if one was interrupted, None otherwise.
+            The session handle is cleared after retrieval.
+        """
+        session = self._interrupted_session
+        self._interrupted_session = None
+        return session
 
     def get_call_history(self) -> list[dict[str, Any]]:
         """Get the history of execute calls.

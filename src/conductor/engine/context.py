@@ -87,6 +87,34 @@ class WorkflowContext:
     execution_history: list[str] = field(default_factory=list)
     """Ordered list of executed agent names."""
 
+    user_guidance: list[str] = field(default_factory=list)
+    """Accumulated user guidance from interrupts."""
+
+    def add_guidance(self, text: str) -> None:
+        """Append a user guidance entry.
+
+        Args:
+            text: Guidance text provided by the user during an interrupt.
+        """
+        self.user_guidance.append(text)
+
+    def get_guidance_prompt_section(self) -> str | None:
+        """Format accumulated guidance as a prompt section.
+
+        Returns:
+            Formatted ``[User Guidance]`` section string, or ``None`` if no
+            guidance has been provided.
+        """
+        if not self.user_guidance:
+            return None
+        entries = "\n".join(f"- {g}" for g in self.user_guidance)
+        return (
+            "\n\n[User Guidance]\n"
+            "The following guidance was provided by the user during workflow execution. "
+            "Incorporate this guidance into your response:\n"
+            f"{entries}"
+        )
+
     def set_workflow_inputs(self, inputs: dict[str, Any]) -> None:
         """Store workflow-level inputs.
 
@@ -433,6 +461,42 @@ class WorkflowContext:
                 raise KeyError(
                     f"'{group_name}' is not a for-each group (no 'count' field available)"
                 )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize context to a JSON-compatible dict.
+
+        Returns:
+            Dict containing all context state needed for checkpoint/restore.
+        """
+        import copy
+
+        return {
+            "workflow_inputs": copy.deepcopy(self.workflow_inputs),
+            "agent_outputs": copy.deepcopy(self.agent_outputs),
+            "current_iteration": self.current_iteration,
+            "execution_history": list(self.execution_history),
+            "user_guidance": list(self.user_guidance),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WorkflowContext:
+        """Reconstruct a WorkflowContext from a serialized dict.
+
+        Args:
+            data: Dict previously produced by ``to_dict()``.
+
+        Returns:
+            A new WorkflowContext with restored state.
+        """
+        import copy
+
+        ctx = cls()
+        ctx.workflow_inputs = copy.deepcopy(data.get("workflow_inputs", {}))
+        ctx.agent_outputs = copy.deepcopy(data.get("agent_outputs", {}))
+        ctx.current_iteration = data.get("current_iteration", 0)
+        ctx.execution_history = list(data.get("execution_history", []))
+        ctx.user_guidance = list(data.get("user_guidance", []))
+        return ctx
 
     def get_for_template(self) -> dict[str, Any]:
         """Get full context for template rendering.

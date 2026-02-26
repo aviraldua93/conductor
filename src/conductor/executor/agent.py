@@ -6,12 +6,14 @@ with prompt rendering and output validation.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ValidationError
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.executor.template import TemplateRenderer
-from conductor.providers.base import AgentOutput
+from conductor.providers.base import AgentOutput, EventCallback
 
 
 def _verbose_log(message: str, style: str = "dim") -> None:
@@ -110,6 +112,9 @@ class AgentExecutor:
         self,
         agent: AgentDef,
         context: dict[str, Any],
+        guidance_section: str | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
@@ -122,6 +127,15 @@ class AgentExecutor:
         Args:
             agent: Agent definition from workflow config.
             context: Context for prompt rendering, built by WorkflowContext.
+            guidance_section: Optional user guidance section to append to the
+                rendered prompt. When provided, this is appended after the
+                rendered prompt text.
+            interrupt_signal: Optional event for mid-agent interrupt signaling.
+                Forwarded to the provider's execute method.
+            event_callback: Optional callback for streaming SDK events upstream.
+                When provided, the executor emits an ``agent_prompt_rendered``
+                event with the rendered prompt, then forwards the callback
+                to the provider for SDK-level streaming events.
 
         Returns:
             Validated agent output.
@@ -133,6 +147,21 @@ class AgentExecutor:
         """
         # Render prompt with context
         rendered_prompt = self.renderer.render(agent.prompt, context)
+
+        # Append user guidance section if provided
+        if guidance_section:
+            rendered_prompt = rendered_prompt + guidance_section
+
+        # Emit prompt rendered event via callback
+        if event_callback is not None:
+            with contextlib.suppress(Exception):
+                event_callback(
+                    "agent_prompt_rendered",
+                    {
+                        "rendered_prompt": rendered_prompt,
+                        "context_keys": list(context.keys()) if isinstance(context, dict) else [],
+                    },
+                )
 
         # Verbose: Log rendered prompt
         _verbose_log_section(
@@ -158,6 +187,8 @@ class AgentExecutor:
             context=context,
             rendered_prompt=rendered_prompt,
             tools=resolved_tools,
+            interrupt_signal=interrupt_signal,
+            event_callback=event_callback,
         )
 
         # Ensure output.content is a dict
@@ -179,8 +210,8 @@ class AgentExecutor:
                     model=output.model,
                 )
 
-        # Validate output against schema
-        if agent.output:
+        # Validate output against schema (skip for partial output from interrupts)
+        if agent.output and not output.partial:
             validate_output(output.content, agent.output)
 
         return output

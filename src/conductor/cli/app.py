@@ -250,6 +250,38 @@ def run(
             ),
         ),
     ] = None,
+    no_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--no-interactive",
+            help="Disable interactive interrupt capability (Esc to pause).",
+        ),
+    ] = False,
+    web: Annotated[
+        bool,
+        typer.Option(
+            "--web",
+            help="Start a real-time web dashboard for workflow visualization.",
+        ),
+    ] = False,
+    web_port: Annotated[
+        int,
+        typer.Option(
+            "--web-port",
+            help="Port for the web dashboard (0 = auto-select).",
+        ),
+    ] = 0,
+    web_bg: Annotated[
+        bool,
+        typer.Option(
+            "--web-bg",
+            help=(
+                "Run workflow + dashboard in a background process. "
+                "Prints the dashboard URL and exits immediately. "
+                "Does not require --web."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run a workflow from a YAML file.
 
@@ -267,6 +299,10 @@ def run(
         conductor run workflow.yaml --log-file auto
         conductor run workflow.yaml --log-file debug.log
         conductor run workflow.yaml --silent --log-file auto
+        conductor run workflow.yaml --no-interactive
+        conductor run workflow.yaml --web
+        conductor run workflow.yaml --web --web-port 8080
+        conductor run workflow.yaml --web-bg
     """
     import asyncio
     import json
@@ -291,6 +327,10 @@ def run(
             print_error(e)
             raise typer.Exit(code=1) from None
 
+    # Validate mutually exclusive flags
+    if web and web_bg:
+        raise typer.BadParameter("--web and --web-bg are mutually exclusive")
+
     # Collect inputs from both --input and --input.* patterns
     inputs: dict[str, Any] = {}
 
@@ -309,10 +349,44 @@ def run(
         else:
             resolved_log_file = Path(log_file)
 
+    # Handle --web-bg: fork a background process and exit immediately
+    if web_bg:
+        from conductor.cli.bg_runner import launch_background
+
+        try:
+            url = launch_background(
+                workflow_path=workflow,
+                inputs=inputs,
+                provider_override=provider,
+                skip_gates=skip_gates,
+                log_file=resolved_log_file,
+                no_interactive=True,  # Always non-interactive in background
+                web_port=web_port,
+            )
+            console.print(f"[bold cyan]Dashboard:[/bold cyan] {url}")
+            console.print(
+                "[dim]Workflow running in background. Dashboard auto-shuts down after "
+                "workflow completes and all clients disconnect.[/dim]"
+            )
+        except Exception as e:
+            print_error(e)
+            raise typer.Exit(code=1) from None
+        return
+
     try:
         # Run the workflow
         result = asyncio.run(
-            run_workflow_async(workflow, inputs, provider, skip_gates, resolved_log_file)
+            run_workflow_async(
+                workflow,
+                inputs,
+                provider,
+                skip_gates,
+                resolved_log_file,
+                no_interactive,
+                web=web,
+                web_port=web_port,
+                web_bg=web_bg,
+            )
         )
 
         # Output as JSON to stdout
@@ -432,3 +506,187 @@ def templates() -> None:
     from conductor.cli.init import display_templates
 
     display_templates(output_console)
+
+
+@app.command()
+def resume(
+    workflow: Annotated[
+        Path | None,
+        typer.Argument(
+            help="Path to the workflow YAML file. Finds the latest checkpoint for this workflow.",
+        ),
+    ] = None,
+    from_checkpoint: Annotated[
+        Path | None,
+        typer.Option(
+            "--from",
+            help="Path to a specific checkpoint file to resume from.",
+        ),
+    ] = None,
+    skip_gates: Annotated[
+        bool,
+        typer.Option(
+            "--skip-gates",
+            help="Auto-select first option at human gates (for automation).",
+        ),
+    ] = False,
+    log_file: Annotated[
+        str | None,
+        typer.Option(
+            "--log-file",
+            "-l",
+            help=(
+                "Write full debug output to a file. "
+                "Pass a file path or 'auto' for auto-generated temp file."
+            ),
+        ),
+    ] = None,
+    no_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--no-interactive",
+            help="Disable interactive interrupt capability (Esc to pause).",
+        ),
+    ] = False,
+) -> None:
+    """Resume a workflow from a checkpoint after failure.
+
+    Loads a previously saved checkpoint and resumes execution from
+    the agent that failed. The checkpoint contains all prior agent
+    outputs so execution continues seamlessly.
+
+    Either provide a workflow file (to find the latest checkpoint) or
+    use --from to specify a checkpoint file directly.
+
+    \b
+    Examples:
+        conductor resume workflow.yaml
+        conductor resume --from /tmp/conductor/checkpoints/my-workflow-20260224-153000.json
+        conductor resume workflow.yaml --skip-gates
+        conductor resume workflow.yaml --log-file auto
+        conductor resume workflow.yaml --no-interactive
+    """
+    import asyncio
+    import json
+
+    from conductor.cli.run import generate_log_path, resume_workflow_async
+
+    # Validate arguments
+    if workflow is None and from_checkpoint is None:
+        console.print(
+            "[bold red]Error:[/bold red] "
+            "Provide a workflow file or use --from to specify a checkpoint."
+        )
+        console.print(
+            "[dim]Usage: conductor resume workflow.yaml "
+            "or conductor resume --from <checkpoint.json>[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+    # Resolve workflow path if provided (Typer doesn't auto-resolve optional args)
+    resolved_workflow: Path | None = None
+    if workflow is not None:
+        resolved_workflow = workflow.resolve()
+        if not resolved_workflow.exists():
+            console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
+            raise typer.Exit(code=1)
+
+    # Resolve checkpoint path if provided
+    resolved_checkpoint: Path | None = None
+    if from_checkpoint is not None:
+        resolved_checkpoint = from_checkpoint.resolve()
+        if not resolved_checkpoint.exists():
+            console.print(
+                f"[bold red]Error:[/bold red] Checkpoint file not found: {from_checkpoint}"
+            )
+            raise typer.Exit(code=1)
+
+    # Resolve log file path
+    resolved_log_file: Path | None = None
+    if log_file is not None:
+        if log_file.lower() == "auto":
+            name = workflow.stem if workflow else "resume"
+            resolved_log_file = generate_log_path(name)
+        else:
+            resolved_log_file = Path(log_file)
+
+    try:
+        result = asyncio.run(
+            resume_workflow_async(
+                workflow_path=resolved_workflow,
+                checkpoint_path=resolved_checkpoint,
+                skip_gates=skip_gates,
+                log_file=resolved_log_file,
+                no_interactive=no_interactive,
+            )
+        )
+
+        # Output as JSON to stdout
+        output_console.print_json(json.dumps(result))
+
+    except Exception as e:
+        print_error(e)
+        raise typer.Exit(code=1) from None
+
+
+@app.command()
+def checkpoints(
+    workflow: Annotated[
+        Path | None,
+        typer.Argument(
+            help="Path to a workflow YAML file. Filters checkpoints to this workflow only.",
+        ),
+    ] = None,
+) -> None:
+    """List available workflow checkpoints.
+
+    Shows all checkpoint files with metadata including workflow name,
+    timestamp, failed agent, and error type. Optionally filter by
+    workflow file.
+
+    \b
+    Examples:
+        conductor checkpoints
+        conductor checkpoints workflow.yaml
+    """
+    from rich.table import Table
+
+    from conductor.engine.checkpoint import CheckpointManager
+
+    # Resolve workflow path for filtering
+    resolved_workflow: Path | None = None
+    if workflow is not None:
+        resolved_workflow = workflow.resolve()
+        if not resolved_workflow.exists():
+            console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
+            raise typer.Exit(code=1)
+
+    checkpoint_list = CheckpointManager.list_checkpoints(resolved_workflow)
+
+    if not checkpoint_list:
+        if resolved_workflow:
+            output_console.print(
+                f"[dim]No checkpoints found for workflow: {resolved_workflow.name}[/dim]"
+            )
+        else:
+            output_console.print("[dim]No checkpoints found.[/dim]")
+        return
+
+    table = Table(title="Workflow Checkpoints", show_lines=True)
+    table.add_column("Workflow", style="cyan")
+    table.add_column("Timestamp", style="green")
+    table.add_column("Failed Agent", style="yellow")
+    table.add_column("Error Type", style="red")
+    table.add_column("File", style="dim")
+
+    for cp in checkpoint_list:
+        workflow_name = Path(cp.workflow_path).stem
+        timestamp = cp.created_at
+        failed_agent = cp.failure.get("agent", "unknown")
+        error_type = cp.failure.get("error_type", "unknown")
+        file_path = str(cp.file_path)
+
+        table.add_row(workflow_name, timestamp, failed_agent, error_type, file_path)
+
+    output_console.print(table)
+    output_console.print(f"\n[dim]Total: {len(checkpoint_list)} checkpoint(s)[/dim]")

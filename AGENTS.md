@@ -32,6 +32,12 @@ make check
 # Run a workflow
 uv run conductor run workflow.yaml --input question="What is Python?"
 
+# Run with web dashboard
+uv run conductor run workflow.yaml --web --input question="What is Python?"
+
+# Run in background (prints dashboard URL and exits)
+uv run conductor run workflow.yaml --web-bg --input question="What is Python?"
+
 # Validate a workflow
 uv run conductor validate examples/simple-qa.yaml
 make validate-examples    # validate all examples
@@ -44,6 +50,7 @@ make validate-examples    # validate all examples
 - **cli/**: Typer-based CLI with commands `run`, `validate`, `init`, `templates`
   - `app.py` - Main entry point, defines the Typer application
   - `run.py` - Workflow execution command with verbose logging helpers
+  - `bg_runner.py` - Background process forking for `--web-bg` mode
 
 - **config/**: YAML loading and Pydantic schema validation
   - `schema.py` - Pydantic models for all workflow YAML structures (WorkflowConfig, AgentDef, ParallelGroup, ForEachDef, etc.)
@@ -58,6 +65,7 @@ make validate-examples    # validate all examples
 
 - **executor/**: Agent execution
   - `agent.py` - `AgentExecutor` handles prompt rendering, tool resolution, and output validation for single agents
+  - `script.py` - `ScriptExecutor` runs shell commands as workflow steps, capturing stdout/stderr/exit_code
   - `template.py` - Jinja2 template rendering
   - `output.py` - JSON output parsing and schema validation
 
@@ -69,17 +77,24 @@ make validate-examples    # validate all examples
 - **gates/**: Human-in-the-loop support
   - `human.py` - Rich terminal UI for human gate interactions
 
+- **web/**: Real-time web dashboard for workflow visualization
+  - `server.py` - FastAPI + uvicorn server with WebSocket broadcasting and late-joiner state replay
+  - `static/index.html` - Single-file Cytoscape.js frontend with DAG graph, agent detail panel, and streaming activity
+
+- **events.py**: Pub/sub event system decoupling workflow execution from rendering (console, web dashboard)
+
 - **exceptions.py**: Custom exception hierarchy (ConductorError, ValidationError, ExecutionError, etc.)
 
 ### Workflow Execution Flow
 
 1. CLI parses YAML via `config/loader.py` → `WorkflowConfig`
 2. `WorkflowEngine` initializes with config and provider
-3. Engine loops: find agent/parallel/for-each → execute → evaluate routes → next
+3. Engine loops: find agent/parallel/for-each/script → execute → evaluate routes → next
 4. Parallel groups execute agents concurrently with context isolation (deep copy snapshot)
 5. For-each groups resolve source arrays at runtime, inject loop variables (`{{ item }}`, `{{ _index }}`, `{{ _key }}`)
-6. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
-7. Final output built from templates in `output:` section
+6. Script steps run shell commands via asyncio subprocess, expose stdout/stderr/exit_code to context
+7. Routes evaluated via `Router` using Jinja2 or simpleeval expressions
+8. Final output built from templates in `output:` section
 
 ### Key Patterns
 
