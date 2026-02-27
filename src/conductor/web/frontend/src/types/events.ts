@@ -39,6 +39,7 @@ export type EventType =
 
 export interface WorkflowStartedData {
   name: string;
+  entry_point?: string;
   agents: Array<{ name: string; type?: string; model?: string }>;
   routes: Array<{ from: string; to: string; when?: string }>;
   parallel_groups?: Array<{ name: string; agents: string[] }>;
@@ -140,10 +141,18 @@ export interface ScriptFailedData {
 
 // --- Gate events ---
 
+export interface GateOptionDetail {
+  label: string;
+  value: string;
+  route: string;
+  prompt_for?: string | null;
+}
+
 export interface GatePresentedData {
   agent_name: string;
   prompt?: string;
   options?: string[];
+  option_details?: GateOptionDetail[];
 }
 
 export interface GateResolvedData {
@@ -198,18 +207,26 @@ export interface ForEachStartedData {
 
 export interface ForEachItemStartedData {
   group_name: string;
+  item_key: string;
   index: number;
-  item: unknown;
+  item?: unknown;
 }
 
 export interface ForEachItemCompletedData {
   group_name: string;
+  item_key: string;
   index: number;
+  elapsed?: number;
+  tokens?: number;
+  cost_usd?: number;
+  output?: unknown;
 }
 
 export interface ForEachItemFailedData {
   group_name: string;
+  item_key: string;
   index: number;
+  elapsed?: number;
   error_type?: string;
   message?: string;
 }

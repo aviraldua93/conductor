@@ -9,22 +9,27 @@ import type { NodeStatus } from '@/lib/constants';
 
 export const AgentNode = memo(function AgentNode({ data, id, selected }: NodeProps) {
   const nodeData = data as unknown as GraphNodeData;
-  const status = (nodeData.status || 'pending') as NodeStatus;
+  // Read status directly from the store so parallel-group child nodes update
+  // immediately instead of waiting for the graph-data sync useEffect.
+  const storeStatus = useWorkflowStore((s) => s.nodes[id]?.status);
+  const status = (storeStatus || nodeData.status || 'pending') as NodeStatus;
   const borderColor = NODE_STATUS_HEX[status] || NODE_STATUS_HEX.pending;
 
   const elapsed = useWorkflowStore((s) => s.nodes[id]?.elapsed);
   const model = useWorkflowStore((s) => s.nodes[id]?.model);
   const tokens = useWorkflowStore((s) => s.nodes[id]?.tokens);
   const costUsd = useWorkflowStore((s) => s.nodes[id]?.cost_usd);
+  const iteration = useWorkflowStore((s) => s.nodes[id]?.iteration);
 
   const tooltip = useMemo(() => {
     const parts: string[] = [`Status: ${status}`];
+    if (iteration != null && iteration > 1) parts.push(`Iteration: ${iteration}`);
     if (elapsed != null) parts.push(`Elapsed: ${formatSec(elapsed)}`);
     if (model) parts.push(`Model: ${model}`);
     if (tokens != null) parts.push(`Tokens: ${tokens.toLocaleString()}`);
     if (costUsd != null) parts.push(`Cost: $${costUsd.toFixed(4)}`);
     return parts.join('\n');
-  }, [status, elapsed, model, tokens, costUsd]);
+  }, [status, elapsed, model, tokens, costUsd, iteration]);
 
   return (
     <>
@@ -48,6 +53,17 @@ export const AgentNode = memo(function AgentNode({ data, id, selected }: NodePro
           <Bot className="w-3.5 h-3.5" style={{ color: borderColor }} />
         </div>
         <span className="text-xs font-medium text-[var(--text)] truncate">{nodeData.label}</span>
+        {iteration != null && iteration > 1 && (
+          <span
+            className="ml-auto flex-shrink-0 inline-flex items-center justify-center px-1.5 py-0.5 rounded-full text-[9px] font-bold leading-none"
+            style={{
+              backgroundColor: `${borderColor}25`,
+              color: borderColor,
+            }}
+          >
+            ×{iteration}
+          </span>
+        )}
       </div>
       <Handle type="source" position={Position.Bottom} className="!bg-[var(--border)] !border-none !w-2 !h-2" />
     </>
