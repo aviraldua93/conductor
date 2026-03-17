@@ -301,6 +301,23 @@ def run_update(console: Console) -> None:
     install_url = f"git+{_REPO_GIT_URL}@{tag_name}"
     cmd = ["uv", "tool", "install", "--force", install_url]
 
+    if sys.platform == "win32":
+        # Windows locks running executables — spawn uv detached and exit
+        # so conductor.exe releases its file lock before uv overwrites it.
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(  # noqa: S603
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        )
+        console.print(f"Upgrade to v{version} started in background. It will complete momentarily.")
+        # Clear cache so next run re-checks
+        cache_path = get_cache_path()
+        cache_path.unlink(missing_ok=True)
+        return
+
     proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
 
     if proc.returncode == 0:

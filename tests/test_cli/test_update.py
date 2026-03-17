@@ -505,6 +505,74 @@ class TestRunUpdate:
         assert len(install_arg) == 1
         assert install_arg[0].endswith("@v2.0.0")
 
+    def test_windows_uses_detached_process(self, cache_dir: Path) -> None:
+        """On Windows, ``run_update`` spawns a detached ``Popen`` and exits early."""
+        import subprocess as sp
+
+        cache_file = cache_dir / "update-check.json"
+        cache_file.write_text("{}")
+
+        c, buf = _make_console(is_terminal=True)
+
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch("conductor.cli.update.sys.platform", "win32"),
+            patch("conductor.cli.update.subprocess.Popen") as mock_popen,
+            patch("conductor.cli.update.subprocess.run") as mock_run,
+        ):
+            run_update(c)
+
+        # Popen must be called with DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        mock_popen.assert_called_once()
+        call_kwargs = mock_popen.call_args[1]
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        expected_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        assert call_kwargs["creationflags"] == expected_flags
+        assert call_kwargs["stdout"] == sp.DEVNULL
+        assert call_kwargs["stderr"] == sp.DEVNULL
+
+        # subprocess.run must NOT be called on Windows
+        mock_run.assert_not_called()
+
+        # Output should mention background
+        output = buf.getvalue()
+        assert "started in background" in output
+
+        # Cache should be cleared
+        assert not cache_file.exists()
+
+    def test_unix_uses_synchronous_subprocess(self, cache_dir: Path) -> None:
+        """On non-Windows platforms, ``run_update`` uses synchronous ``subprocess.run``."""
+        c, buf = _make_console(is_terminal=True)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = ""
+
+        with (
+            patch(
+                "conductor.cli.update.fetch_latest_version",
+                return_value=("99.0.0", "v99.0.0", "https://example.com"),
+            ),
+            patch("conductor.cli.update.sys.platform", "linux"),
+            patch("conductor.cli.update.subprocess.run", return_value=mock_proc) as mock_run,
+            patch("conductor.cli.update.subprocess.Popen") as mock_popen,
+        ):
+            run_update(c)
+
+        # subprocess.run must be called on Linux
+        mock_run.assert_called_once()
+
+        # Popen must NOT be called on Linux
+        mock_popen.assert_not_called()
+
+        # Output should mention successful upgrade (synchronous path)
+        output = buf.getvalue()
+        assert "Successfully upgraded" in output
+
 
 # ===================================================================
 # E3-T3: CLI-level tests
