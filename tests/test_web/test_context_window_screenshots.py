@@ -38,8 +38,10 @@ def _build_events(
                 "workflow_name": "context-window-test",
                 "entry_point": "agent1",
                 "agents": [
-                    {"name": "agent1", "type": "agent", "model": model, "routes": [{"to": "agent2"}]},
-                    {"name": "agent2", "type": "agent", "model": model, "routes": [{"to": "$end"}]},
+                    {"name": "agent1", "type": "agent", "model": model,
+                     "routes": [{"to": "agent2"}]},
+                    {"name": "agent2", "type": "agent", "model": model,
+                     "routes": [{"to": "$end"}]},
                 ],
                 "parallel": [],
                 "for_each": [],
@@ -262,7 +264,10 @@ async def run_tests() -> None:
                         if "context" in detail_text.lower() or str(int(pct)) in detail_text:
                             assertions.append(f"[{label}] Context info in detail panel")
                         else:
-                            assertions.append(f"[{label}] Detail panel rendered (context info may be formatted differently)")
+                            assertions.append(
+                                f"[{label}] Detail panel rendered"
+                                " (context info may be formatted differently)"
+                            )
 
                     path = str(SCREENSHOTS_DIR / f"ctx-{label}-detail.png")
                     await page.screenshot(path=path, full_page=False)
