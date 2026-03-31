@@ -9,6 +9,7 @@ from conductor.config.schema import (
     ContextConfig,
     LimitsConfig,
     OutputField,
+    ParallelGroup,
     RouteDef,
     RuntimeConfig,
     WorkflowConfig,
@@ -144,3 +145,94 @@ class TestContextWindowNoneForUnknownModel:
 
         event = collector.first("agent_started")
         assert event.data["context_window_max"] is None
+
+
+class TestParallelAgentContextWindow:
+    """parallel_agent_completed event includes context_window_used and context_window_max."""
+
+    @pytest.mark.asyncio
+    async def test_parallel_agent_completed_has_context_window_fields(self) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-parallel-ctx",
+                entry_point="team",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="r1",
+                    model="gpt-4o",
+                    prompt="research 1",
+                    output={"result": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="r2",
+                    model="gpt-4o",
+                    prompt="research 2",
+                    output={"result": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="team",
+                    agents=["r1", "r2"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "done"},
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": a.name})
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        events = collector.of_type("parallel_agent_completed")
+        assert len(events) == 2
+        for event in events:
+            assert "context_window_used" in event.data
+            assert "context_window_max" in event.data
+            assert event.data["context_window_max"] == 128000
+
+    @pytest.mark.asyncio
+    async def test_parallel_agent_unknown_model_context_window_none(self) -> None:
+        emitter, collector = _make_emitter_and_collector()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-parallel-unknown",
+                entry_point="team",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="r1",
+                    model="exotic-model-x",
+                    prompt="research",
+                    output={"result": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="r2",
+                    model="exotic-model-x",
+                    prompt="research 2",
+                    output={"result": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="team",
+                    agents=["r1", "r2"],
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "done"},
+        )
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": "ok"})
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        await engine.run({})
+
+        events = collector.of_type("parallel_agent_completed")
+        for event in events:
+            assert event.data["context_window_max"] is None

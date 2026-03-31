@@ -117,8 +117,6 @@ export interface AgentToolCompleteData {
 export interface AgentTurnStartData {
   agent_name: string;
   turn?: number;
-  context_window_used?: number;
-  context_window_max?: number;
 }
 
 export interface AgentMessageData {
